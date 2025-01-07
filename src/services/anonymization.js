@@ -161,76 +161,132 @@ export class AnonymizationService {
   async initializeContainer() {
     logger.info('Starting PostgreSQL Anonymizer container...');
     try {
-      const containerConfig = {
-        Image: 'registry.gitlab.com/dalibo/postgresql_anonymizer:stable',
-        Env: [
-          'POSTGRES_PASSWORD=anon_password',
-          'POSTGRES_DB=postgres'
-        ],
-        HostConfig: {
-          PortBindings: {
-            '5432/tcp': [{ HostPort: this.localPort.toString() }]
-          },
-          RestartPolicy: {
-            Name: 'on-failure',
-            MaximumRetryCount: 3
-          },
-          Memory: 2147483648, // 2GB
-          MemorySwap: 4294967296, // 4GB
-          Volumes: {
-            '/var/lib/postgresql/data': {}
-          },
-          Binds: [
-            'pgdata:/var/lib/postgresql/data'
-          ]
-        },
-        Healthcheck: {
-          Test: ["CMD-SHELL", "pg_isready -U postgres"],
-          Interval: 2000000000, // 2s in nanoseconds
-          Timeout: 3000000000,  // 3s
-          Retries: 10
+        const containerConfig = {
+            Image: 'registry.gitlab.com/dalibo/postgresql_anonymizer:latest',
+            Env: [
+                `POSTGRES_PASSWORD=${this.password}`,
+                `POSTGRES_USER=${this.user}`,
+                `POSTGRES_DB=${this.databaseName}`,
+                'PGDATA=/var/lib/postgresql/data/pgdata'
+            ],
+            HostConfig: {
+                PortBindings: {
+                    '5432/tcp': [{ HostPort: this.localPort.toString() }]
+                },
+                RestartPolicy: {
+                    Name: 'no',
+                    MaximumRetryCount: 0
+                },
+                Memory: 2147483648, // 2GB
+                MemorySwap: 4294967296, // 4GB
+                Binds: [
+                    'pgdata:/var/lib/postgresql/data/pgdata' // Updated path
+                ]
+            },
+            Healthcheck: {
+                Test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"],
+                Interval: 1000000000, // 1s in nanoseconds
+                Timeout: 3000000000,  // 3s
+                Retries: 5,
+                StartPeriod: 3000000000 // 3s initialization time
+            }
+        };
+
+        // Check and create volume if needed
+        const volumes = await this.docker.listVolumes();
+        if (!volumes.Volumes.find(v => v.Name === 'pgdata')) {
+            await this.docker.createVolume({ 
+                Name: 'pgdata',
+                Driver: 'local'
+            });
+            logger.info('Created pgdata volume');
         }
-      };
-  
-      // Create container
-      this.container = await this.docker.createContainer(containerConfig);
-      
-      // Start container with timeout
-      await Promise.race([
-        this.container.start(),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Container start timeout')), 30000)
-        )
-      ]);
-  
-      // Wait for container to be healthy
-      logger.info('Waiting for container health check...');
-      await this.waitForContainerHealth();
-      
-      logger.info('Container started successfully and ready');
+
+        // Pull image with proper progress tracking
+        try {
+            await this.docker.getImage(containerConfig.Image).inspect();
+        } catch (err) {
+            logger.info('Pulling PostgreSQL Anonymizer image...');
+            await new Promise((resolve, reject) => {
+                this.docker.pull(containerConfig.Image, (err, stream) => {
+                    if (err) return reject(err);
+                    this.docker.modem.followProgress(stream, 
+                        (err) => err ? reject(err) : resolve(),
+                        (event) => logger.debug('Pull progress:', event)
+                    );
+                });
+            });
+        }
+
+        // Create and start container
+        this.container = await this.docker.createContainer(containerConfig);
+        await this.container.start();
+
+        // Attach logging
+        const logStream = await this.container.logs({
+            follow: true,
+            stdout: true,
+            stderr: true,
+            timestamps: true
+        });
+
+        logStream.on('data', data => {
+            logger.debug('Container log:', data.toString().trim());
+        });
+
+        // Wait for health check
+        logger.info('Waiting for container health check...');
+        await this.waitForContainerHealth();
+        logger.info('Container started successfully');
+
     } catch (error) {
-      logger.error('Failed to start container:', error);
-      throw error;
+        logger.error('Container startup failed:', error);
+        
+        // Get container logs if available
+        if (this.container) {
+            try {
+                const logs = await this.container.logs({
+                    stdout: true,
+                    stderr: true,
+                    tail: 50
+                });
+                logger.error('Container logs:', logs.toString());
+            } catch (logError) {
+                logger.error('Failed to fetch container logs:', logError);
+            }
+        }
+        throw error;
     }
-  }
-  
-  async waitForContainerHealth() {
-    const maxRetries = 30;
-    const retryInterval = 1000;
-  
-    for (let i = 0; i < maxRetries; i++) {
-      const containerInfo = await this.container.inspect();
-      const health = containerInfo.State.Health?.Status;
-  
-      if (health === 'healthy') {
-        return;
+}
+
+async waitForContainerHealth() {
+  const maxRetries = 30;
+  const retryInterval = 2000; // 2s
+
+  for (let i = 0; i < maxRetries; i++) {
+      try {
+          const containerInfo = await this.container.inspect();
+          const state = containerInfo.State;
+          
+          if (state.Running && (!state.Health || state.Health.Status === 'healthy')) {
+              return;
+          }
+
+          if (state.ExitCode && state.ExitCode !== 0) {
+              throw new Error(`Container exited with code ${state.ExitCode}`);
+          }
+
+          logger.debug(`Container health status: ${state.Health?.Status || 'unknown'}`);
+          await new Promise(resolve => setTimeout(resolve, retryInterval));
+          
+      } catch (error) {
+          logger.error(`Health check attempt ${i + 1}/${maxRetries} failed:`, error);
+          if (i === maxRetries - 1) throw error;
       }
-  
-      await new Promise(resolve => setTimeout(resolve, retryInterval));
-    }
-    
-    throw new Error('Container health check failed after max retries');
   }
+  
+  throw new Error('Container health check failed after max retries');
+}
 
   async waitForPostgres() {
     logger.info('Waiting for PostgreSQL to be ready...');
@@ -291,7 +347,7 @@ export class AnonymizationService {
       );
     }
   }
-
+  
   async setupAnonymization() {
     const client = new Client({
       host: this.host,
@@ -312,7 +368,7 @@ export class AnonymizationService {
       await client.query('BEGIN');
       await client.query('SELECT anon.init()');
       
-      // Setup anonymization role
+      // Setup anonymization role with enhanced permissions
       await client.query('DROP ROLE IF EXISTS dump_anon');
       await client.query(`
         CREATE ROLE dump_anon LOGIN PASSWORD 'anon_pass';
@@ -320,11 +376,24 @@ export class AnonymizationService {
         SECURITY LABEL FOR anon ON ROLE dump_anon IS 'MASKED';
       `);
       
-      // Grant necessary permissions
+      // Grant comprehensive permissions
       await client.query(`
-        GRANT USAGE ON SCHEMA public TO dump_anon;
+        GRANT USAGE ON SCHEMA public, anon TO dump_anon;
         GRANT SELECT ON ALL TABLES IN SCHEMA public TO dump_anon;
         GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO dump_anon;
+        
+        -- Grant access to anonymization functions and tables
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA anon TO dump_anon;
+        GRANT SELECT ON ALL TABLES IN SCHEMA anon TO dump_anon;
+        
+        -- Allow access to system catalogs needed for pg_dump
+        GRANT SELECT ON pg_statistic TO dump_anon;
+      `);
+      
+      // Make sure future tables are accessible
+      await client.query(`
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public 
+        GRANT SELECT ON TABLES TO dump_anon;
       `);
       
       await client.query('COMMIT');
@@ -338,7 +407,7 @@ export class AnonymizationService {
         logger.error('Error closing client:', err)
       );
     }
-  }
+}
 
   createPool() {
     return new Pool({
