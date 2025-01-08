@@ -21,8 +21,8 @@ This project is a tool designed to anonymize database dumps. It leverages Postgr
 
 1. Clone the repository:
    ```sh
-   git clone https://github.com/your-repo/db_anon.git
-   cd db_anon
+   git clone https://github.com/kur0byte/js-db-anonymizer.git
+   cd js-db-anonymizer
    ```
 
 2. Install dependencies:
