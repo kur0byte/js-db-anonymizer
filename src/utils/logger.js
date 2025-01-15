@@ -1,5 +1,15 @@
 import winston from 'winston';
+import path from 'path';
+import fs from 'fs/promises';
 
+const logsDir = path.resolve('logs');
+
+// Crea la carpeta `logs` si no existe
+await fs.mkdir(logsDir, { recursive: true }).catch(err => {
+  if (err.code !== 'EEXIST') throw err;
+});
+
+// Configura Winston para usar esa carpeta
 export const logger = winston.createLogger({
   level: 'info',
   format: winston.format.combine(
@@ -8,14 +18,16 @@ export const logger = winston.createLogger({
   ),
   transports: [
     new winston.transports.Console({
-      format: winston.format.simple()
+      format: winston.format.simple(),
     }),
-    new winston.transports.File({ 
-      filename: 'error.log', 
-      level: 'error' 
+    // Log de errores en `logs/error.log`
+    new winston.transports.File({
+      filename: path.join(logsDir, 'error.log'),
+      level: 'error',
     }),
-    new winston.transports.File({ 
-      filename: 'combined.log' 
-    })
-  ]
+    // Log combinado en `logs/combined.log`
+    new winston.transports.File({
+      filename: path.join(logsDir, 'combined.log'),
+    }),
+  ],
 });
