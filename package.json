@@ -10,6 +10,7 @@
   "dependencies": {
     "commander": "^11.0.0",
     "dockerode": "^3.3.5",
+    "dotenv": "^16.4.7",
     "js-yaml": "^4.1.0",
     "pg": "^8.11.0",
     "winston": "^3.10.0"
