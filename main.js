@@ -12,6 +12,7 @@ program
   .option('-d, --dump <name>', 'Name of dump file in dumps folder (e.g., dump.sql)')
   .option('-r, --rules <name>', 'Name of rules file in src/rules (e.g., users.rules.js)')
   .option('-o, --output <name>', 'Output file name for anonymized dump')
+  .option('-dbE, --databaseEngine <name>', 'Engine of the database to Dump')
   .parse(process.argv);
 
 const options = program.opts();
@@ -37,7 +38,7 @@ async function main() {
     const rules = await loadRules(options.rules);
 
     // Inicializa el servicio
-    anonService = new AnonymizationService(dumpAbsolutePath);
+    anonService = new AnonymizationService(dumpAbsolutePath,options.databaseEngine);
     await anonService.init();
     await anonService.setup();
     await anonService.processRules(rules);
