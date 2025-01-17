@@ -1,35 +1,27 @@
 import { logger } from '../utils/logger.js';
 import { promisify } from 'util';
-import { exec } from 'child_process';
 import fs from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import readline from 'readline';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
-const execAsync = promisify(exec);
+import path from 'path';
+import { DockerManager } from './docker.js';
 
 export class Dumper {
-  static async preprocessDump(dumpPath) {
+  constructor(){
+    this.dockerManager = new DockerManager();
+  }
+
+  /**
+   * Preprocesses the dump file to comment out unnecessary lines.
+   */
+  async preprocessDump(dumpPath) {
     try {
       logger.info('Preprocessing dump file...');
       const tempPath = `${dumpPath}.processed`;
-      
-      const readStream = createReadStream(dumpPath);
-      const writeStream = createWriteStream(tempPath);
-      
-      const transform = new Transform({
-        transform(chunk, encoding, callback) {
-          let data = chunk.toString()
-            .replace(/SET transaction_timeout = 0;/g, '-- SET transaction_timeout = 0;')
-            .replace(/SELECT pg_catalog.set_config\('search_path', '', false\);/g, 
-                    "SELECT pg_catalog.set_config('search_path', 'public', false);");
-          callback(null, data);
-        }
-      });
-
-      await pipeline(readStream, transform, writeStream);
+      await this.transformDumpFile(dumpPath, tempPath);
       logger.info('Dump file preprocessed successfully');
-      
       return tempPath;
     } catch (error) {
       logger.error('Failed to preprocess dump file:', error);
@@ -37,113 +29,57 @@ export class Dumper {
     }
   }
 
-  static async importDump(config, dumpPath) {
-    if (!dumpPath) {
-      throw new Error('No dump file provided');
-    }
+  async transformDumpFile(inputPath, outputPath) {
+    const readStream = createReadStream(inputPath);
+    const writeStream = createWriteStream(outputPath);
 
-    let processedDumpPath = null;
-    try {
-      logger.info(`Importing dump from ${dumpPath}...`);
-      
-      // Preprocess the dump file
-      processedDumpPath = await this.preprocessDump(dumpPath);
-      
-      // Create schemas first
-      const createSchemasCommand = [
-        `PGPASSWORD=${config.password}`,
-        'psql',
-        `-h ${config.host}`,
-        `-p ${config.port}`,
-        `-U ${config.user}`,
-        `-d ${config.database}`,
-        '-c "CREATE SCHEMA IF NOT EXISTS public;"'
-      ].join(' ');
+    const transform = new Transform({
+      transform(chunk, encoding, callback) {
+        let data = chunk
+          .toString()
+          .replace(/SET transaction_timeout = 0;/g, '-- SET transaction_timeout = 0;')
+          .replace(
+            /SELECT pg_catalog.set_config\('search_path', '', false\);/g,
+            "SELECT pg_catalog.set_config('search_path', 'public', false);"
+          ).replace(/'/g, "''");
 
-      await execAsync(createSchemasCommand);
-      
-      // Import the processed dump
-      const command = [
-        `PGPASSWORD=${config.password}`,
-        'psql',
-        `-h ${config.host}`,
-        `-p ${config.port}`,
-        `-U ${config.user}`,
-        `-d ${config.database}`,
-        '--set ON_ERROR_STOP=off', // Changed to off to continue on errors
-        '--echo-errors',
-        `-f ${processedDumpPath}`
-      ].join(' ');
+        callback(null, data);
+      },
+    });
 
-      const { stdout, stderr } = await execAsync(command);
-      
-      if (stderr && !stderr.includes('SET')) {
-        logger.warn('Import produced warnings:', stderr);
-      }
-      
-      logger.info('Database dump imported successfully');
-      return stdout;
-    } catch (error) {
-      logger.error('Failed to import database dump:', error);
-      throw error;
-    } finally {
-      // Clean up processed dump file
-      if (processedDumpPath) {
-        try {
-          await fs.unlink(processedDumpPath);
-        } catch (err) {
-          logger.warn('Failed to clean up processed dump file:', err);
-        }
-      }
-    }
+    await pipeline(readStream, transform, writeStream);
   }
 
-  static async validateDump(dumpPath) {
+  /**
+   * Validates the structure and content of a dump file.
+   */
+  async validateDump(dumpPath) {
+    if (!dumpPath) throw new Error('Dump path is required for validation');
+
     try {
       logger.info(`Validating dump file: ${dumpPath}`);
-      
       const validation = {
         hasTableDefinitions: false,
         hasData: false,
         pgVersion: null,
-        isValid: false
+        isValid: false,
       };
 
-      const readStream = createReadStream(dumpPath, {
-        highWaterMark: 64 * 1024 // 64KB chunks
-      });
-
-      const rl = readline.createInterface({
-        input: readStream,
-        crlfDelay: Infinity
-      });
+      const readStream = createReadStream(dumpPath, { highWaterMark: 64 * 1024 });
+      const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
 
       for await (const line of rl) {
-        if (line.includes('CREATE TABLE')) {
-          validation.hasTableDefinitions = true;
-        }
-        if (line.includes('INSERT INTO')) {
-          validation.hasData = true;
-        }
+        if (line.includes('CREATE TABLE')) validation.hasTableDefinitions = true;
+        if (line.includes('INSERT INTO')) validation.hasData = true;
         if (line.includes('-- Dumped from database version')) {
-          const versionMatch = line.match(/-- Dumped from database version (\d+)/);
-          if (versionMatch) {
-            validation.pgVersion = parseInt(versionMatch[1]);
-          }
+          const match = line.match(/-- Dumped from database version (\d+)/);
+          if (match) validation.pgVersion = parseInt(match[1]);
         }
-        
-        // Exit early if we found everything we need
-        if (validation.hasTableDefinitions && 
-            validation.hasData && 
-            validation.pgVersion) {
-          break;
-        }
+
+        if (validation.hasTableDefinitions && validation.hasData && validation.pgVersion) break;
       }
 
-      validation.isValid = true;
-      rl.close();
-      readStream.destroy();
-
+      validation.isValid = validation.hasTableDefinitions && validation.hasData && !!validation.pgVersion;
       return validation;
     } catch (error) {
       logger.error('Failed to validate dump file:', error);
@@ -151,59 +87,64 @@ export class Dumper {
     }
   }
 
-  static async createStructureDump(config, fileName) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '');
-    const dumpFile = `${fileName}_structure_${timestamp}.sql`;
-    
-    try {
-      const command = [
-        `PGPASSWORD=${config.password}`,
-        'pg_dump',
-        `-h ${config.host}`,
-        `-p ${config.port}`,
-        `-U ${config.user}`,
-        `-d ${config.database}`,
-        '--schema-only',
-        '--no-owner',
-        '--no-acl'
-      ].join(' ');
+  /**
+   * Creates a database structure dump.
+   */
+  async createStructureDump(config, fileName) {
+    return this.createDump(config, fileName, { schemaOnly: true });
+  }
 
-      const { stdout } = await execAsync(command);
+  /**
+   * Creates a full database dump (data and schema).
+   */
+  async dumpDatabase(config, fileName) {
+    return this.createDump(config, fileName, { schemaOnly: false });
+  }
+
+  /**
+   * Generalized dump creation logic.
+   */
+  async createDump(config, fileName, { schemaOnly = false } = {}) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '');
+    const dumpFile = `${fileName}_${timestamp}.sql`;
+
+    try {
+      const stdout = await this.dockerManager.runPgDump('dump_postgresql', config, schemaOnly);
       await fs.writeFile(dumpFile, stdout);
-      
+      logger.info(`Dump created successfully: ${dumpFile}`);
       return dumpFile;
     } catch (error) {
-      logger.error('Failed to create structure dump:', error);
+      logger.error('Failed to create dump:', error);
       throw error;
     }
   }
 
-  static async dumpDatabase(config, fileName) {
-    logger.info('Creating dump of database...');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '');
-    const dumpFile = `${config.database}_${fileName}_${timestamp}.sql`;
-    
-    try {
-      const command = [
-        `PGPASSWORD=${config.password}`,
-        'pg_dump',
-        `-h ${config.host}`,
-        `-p ${config.port}`,
-        `-U ${config.user}`,
-        `-d ${config.database}`,
-        '--format=plain',
-        '--no-owner',
-        '--no-acl',
-        config.securityLabels ? '--no-security-labels' : ''
-      ].join(' ');
+  /**
+   * Imports a dump file into the database.
+   */
+  async importDump(config, dumpPath) {
+    if (!dumpPath) throw new Error('No dump file provided');
 
-      const { stdout } = await execAsync(command);
-      await fs.writeFile(dumpFile, stdout);
-      
-      logger.info(`Database dump created successfully: ${dumpFile}`);
-      return dumpFile;
+    try {
+      await this.dockerManager.runPsql('dump_postgresql', config, dumpPath);
+      logger.info('Database dump imported successfully');
     } catch (error) {
-      logger.error('Failed to create database dump:', error);
+      logger.error('Failed to import database dump:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Resets the target database (drops and recreates it).
+   */
+  async resetDatabase(client, dbName) {
+    try {
+      logger.info('Resetting database...');
+      await client.query(`DROP DATABASE IF EXISTS ${dbName}`);
+      await client.query(`CREATE DATABASE ${dbName}`);
+      logger.info('Database reset successfully');
+    } catch (error) {
+      logger.error('Failed to reset database:', error);
       throw error;
     }
   }
