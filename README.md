@@ -1,27 +1,35 @@
-# Database Anonymization Tool
+# Database Anonymization Tool 🚀
 
-## Overview
+Hey devs! 👋 Welcome to the ultimate solution for anonymizing your PostgreSQL database dumps like a pro. Whether you’re sharing data or testing in non-production environments, this tool ensures your sensitive information stays safe and sound. 💾✨
 
-This project is a tool designed to anonymize database dumps. It leverages PostgreSQL and the PostgreSQL Anonymizer extension to mask sensitive data in database dumps, ensuring that the data can be safely shared or used in non-production environments.
+---
 
-## Features
+## Features 🔥
 
-- **Database Dump Creation**: Create dumps of your PostgreSQL database.
-- **Anonymization**: Apply anonymization rules to mask sensitive data.
-- **Docker Integration**: Uses Docker to run PostgreSQL with the Anonymizer extension.
-- **Logging**: Comprehensive logging using Winston.
+- **Dump Creation**: Seamlessly create PostgreSQL database dumps.
+- **Data Anonymization**: Apply customizable masking rules to protect sensitive data.
+- **Docker Integration**: Effortlessly run PostgreSQL with the Anonymizer extension inside Docker containers.
+- **Enhanced Compatibility**: Generate dumps that work on any PostgreSQL installation—no extensions required.
+- **Detailed Logs**: Track everything with comprehensive logging powered by Winston.
 
-## Prerequisites
+---
 
-- **Node.js**: Ensure you have Node.js installed.
-- **Docker**: Docker must be installed and running on your machine.
-- **PostgreSQL**: The tool is designed to work with PostgreSQL databases.
+## Prerequisites 🛠️
 
-## Installation
+Before you dive in, make sure you have the following:
+
+- **Node.js**: Version 16 or higher.
+- **Docker**: Installed and running on your machine.
+- **PostgreSQL**: Ensure the source database is PostgreSQL.
+
+---
+
+## Installation 💻
 
 1. Clone the repository:
    ```sh
    git clone https://github.com/kur0byte/js-db-anonymizer.git
+   
    cd js-db-anonymizer
    ```
 
@@ -30,34 +38,39 @@ This project is a tool designed to anonymize database dumps. It leverages Postgr
    npm install
    ```
 
-## Usage
+---
 
-### Command Line Interface
+## Usage 🎯
 
-The tool provides a CLI for creating and anonymizing database dumps.
+### Command Line Interface (CLI)
+
+Run the program to anonymize a dump:
 
 ```sh
-./main.js -d <path_to_dump> -r <path_to_rules> -o <output_file>
+./main.js -d <dump.sql> -r <rules.js> -o <output.sql> -dbE <postgres>
 ```
 
+**Parameters:**
 - `-d, --dump <path>`: Path to the original dump file.
-- `-r, --rules <path>`: Path to the rules file.
-- `-o, --output <path>`: Output file name for the anonymized dump.
+- `-r, --rules <path>`: Path to the anonymization rules file.
+- `-o, --output <path>`: Output file name for anonymized dump.
+- `-dbE, --databaseEngine <path>`: Engine of the database to Dump.
 
 ### Example
 
 ```sh
-./main.js -d dumps/original_dump.sql -r src/rules/users.rules.js -o anonymized_dump
+node main.js -d dump.sql -r users.rules.js -o Customers -dbE postgres
 ```
 
-## Configuration
+---
+
+## Configuration ⚙️
 
 ### Logger
 
-The logger is configured using Winston and logs to both the console and files.
+The logger uses Winston for detailed logs in both console and files:
 
 ```javascript
-// filepath: /Users/kur0-hf/Documents/personal-repos/db_anon/src/utils/logger.js
 import winston from 'winston';
 
 export const logger = winston.createLogger({
@@ -81,12 +94,11 @@ export const logger = winston.createLogger({
 });
 ```
 
-### Anonymization Rules
+### Anonymization Rules 🛡️
 
-Anonymization rules are defined in JavaScript files. Here is an example rule file:
+Define your anonymization rules in JavaScript files. Example:
 
 ```javascript
-// filepath: /Users/kur0-hf/Documents/personal-repos/db_anon/src/rules/users.rules.js
 export const testDbRules = {
   users: {
     masks: {
@@ -99,31 +111,41 @@ export const testDbRules = {
       last_login: 'anon.random_date()'
     }
   }
-}
+};
 ```
-For further information of the anonymization functions please refer to the [Postgres Anonymization Docs](https://postgresql-anonymizer.readthedocs.io/en/stable/masking_functions/).
 
-## Development
+For more masking functions, check out the [PostgreSQL Anonymizer Docs](https://postgresql-anonymizer.readthedocs.io/en/stable/masking_functions/).
 
-<!-- ### Project Structure
+---
 
-- `src/utils`: Utility functions including logger and configuration loaders.
-- `src/services`: Core services for dumping and anonymizing databases.
-- `src/rules`: Anonymization rules.
-- `main.js`: Entry point for the CLI. -->
+## How It Works 🛠️
 
-<!-- ### Running Tests -->
+### 1. **Dump Preprocessing**:
+   - Escapes problematic characters (`'` → `''`).
+   - Adjusts invalid settings for generic PostgreSQL compatibility.
 
-<!-- To run tests, use the following command: -->
+### 2. **Setup & Anonymization**:
+   - Loads and applies masking rules to specified tables and columns.
 
-<!-- ```sh
-npm test
-``` -->
+### 3. **Final Dump Generation**:
+   - Cleans up dependencies on the `anon` extension.
+   - Creates a fully anonymized dump compatible with any PostgreSQL installation.
 
-## Contributing
+---
 
-Contributions are welcome! Please open an issue or submit a pull request.
+## Contributing 🤝
 
-## License
+Got ideas or improvements? Contributions are welcome! Open an issue or submit a pull request.
 
-This project is licensed under the MIT License.
+---
+
+## License 📜
+
+This project is licensed under the MIT License. Go ahead and make magic happen! ✨
+
+## Autor ✒️
+
+* **Santiago Zapata** - *Solutions Architect* - [Kuro](https://github.com/kur0byte)
+* **Franz Suárez** - *Backend Developer* - [fsuarezr](https://github.com/fsuarezr)
+
+🧑‍💻 Made with ❤️ by [fsuarezr](https://github.com/fsuarezr) and [Kuro](https://github.com/kur0byte) 🤘 
