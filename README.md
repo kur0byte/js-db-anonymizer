@@ -64,55 +64,35 @@ node main.js -d dump.sql -r users.rules.js -o Customers -dbE postgres
 
 ---
 
-## Configuration ⚙️
+### **About Anonymization Rules** 🛡️
 
-### Logger
+1. **Location:** Place your anonymization rules in the `src/rules` folder.
+2. **Format:** Rules should be a JavaScript file structured as a JSON-like object.
+   - **Top Level:** Define the table name you want to anonymize.
+   - **Inside `masks`:** Specify the columns to anonymize and the masking function to apply.
+   - **Example:**
+   ```javascript
+   export const usersRules = {
+     users: {
+       masks: {
+         first_name: `anon.dummy_first_name()`,
+         last_name: `anon.dummy_last_name()`,
+         email: 'anon.partial_email(email)',
+         password_hash: `anon.random_string(15)`,
+       }
+     }
+   };
+   ```
 
-The logger uses Winston for detailed logs in both console and files:
+### **Where Is the Final Dump Saved?** 🗂️
 
-```javascript
-import winston from 'winston';
+- The generated anonymized dump is automatically saved in the `dumps` folder with a timestamped filename for easy identification.  
+  **Example Filename:** `2025-01-17T01-58-55_anonymized_Customers.sql`.
 
-export const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.Console({
-      format: winston.format.simple()
-    }),
-    new winston.transports.File({ 
-      filename: 'error.log', 
-      level: 'error' 
-    }),
-    new winston.transports.File({ 
-      filename: 'combined.log' 
-    })
-  ]
-});
-```
+### **Detailed Logs** 📝
 
-### Anonymization Rules 🛡️
-
-Define your anonymization rules in JavaScript files. Example:
-
-```javascript
-export const testDbRules = {
-  users: {
-    masks: {
-      first_name: `anon.dummy_first_name()`,
-      last_name: `anon.dummy_last_name()`,
-      email: 'anon.partial_email(email)',
-      password_hash: `anon.random_string(15)`,
-      created_at: 'anon.random_date()',
-      date_of_birth: 'anon.random_date()',
-      last_login: 'anon.random_date()'
-    }
-  }
-};
-```
+- **Location:** Logs are stored in the `logs` folder, with separate files for errors (`error.log`) and functional events (`combined.log`).
+- **Purpose:** These logs help troubleshoot any issues that arise during the anonymization or configuration process.
 
 For more masking functions, check out the [PostgreSQL Anonymizer Docs](https://postgresql-anonymizer.readthedocs.io/en/stable/masking_functions/).
 
