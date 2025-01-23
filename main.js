@@ -9,9 +9,10 @@ import { loadRules } from './src/utils/config.js';
 program
   .version('1.0.0')
   .description('Database Anonymization Tool')
-  .option('-d, --dump <path>', 'Path to original dump file')
-  .option('-r, --rules <path>', 'Path to rules file')
-  .option('-o, --output <path>', 'Output file name')
+  .option('-d, --dump <name>', 'Name of dump file in dumps folder (e.g., dump.sql)')
+  .option('-r, --rules <name>', 'Name of rules file in src/rules (e.g., users.rules.js)')
+  .option('-o, --output <name>', 'Output file name for anonymized dump')
+  .option('-dbE, --databaseEngine <name>', 'Engine of the database to Dump')
   .parse(process.argv);
 
 const options = program.opts();
@@ -19,12 +20,25 @@ const options = program.opts();
 async function main() {
   let anonService = null;
   try {
-    const dumpAbsolutePath = path.resolve(options.dump);
-    const rulesPath = path.resolve('src/rules');
-    
-    const rules = await loadRules(rulesPath, options.rules);
-    
-    anonService = new AnonymizationService(dumpAbsolutePath);
+    // Define el directorio base para los dumps
+    const dumpsDir = path.resolve('dumps');
+
+    // Resuelve la ruta del archivo dump dentro del directorio `dumps`
+    const dumpAbsolutePath = path.join(dumpsDir, options.dump);
+
+    // Valida que el dump exista
+    const fs = await import('fs/promises');
+    try {
+      await fs.access(dumpAbsolutePath);
+    } catch {
+      throw new Error(`Dump file "${options.dump}" not found in ${dumpsDir}`);
+    }
+
+    // Carga las reglas desde `src/rules`
+    const rules = await loadRules(options.rules);
+
+    // Inicializa el servicio
+    anonService = new AnonymizationService(dumpAbsolutePath,options.databaseEngine);
     await anonService.init();
     await anonService.setup();
     await anonService.processRules(rules);
@@ -33,18 +47,18 @@ async function main() {
   } catch (error) {
     logger.error('Failed to run anonymization:', error);
     if (anonService) {
-      await anonService.cleanup().catch(err => 
+      await anonService.cleanup().catch(err =>
         logger.error('Cleanup after failure:', err)
       );
     }
     process.exit(1);
   } finally {
     if (anonService) {
-      await anonService.cleanup().catch(err => 
+      await anonService.cleanup().catch(err =>
         logger.error('Cleanup after failure:', err)
       );
     }
-    process.exit(0)
+    process.exit(0);
   }
 }
 

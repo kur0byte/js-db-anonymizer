@@ -4,3 +4,6 @@ node_modules
 *.sql
 *.log
 *.DS_Store
+.env
+/dumps/*
+/logs/*

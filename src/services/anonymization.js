@@ -1,134 +1,40 @@
-import Docker from 'dockerode';
 import pkg from 'pg';
 import { logger } from '../utils/logger.js';
+import { DockerManager } from './docker.js';
 import { Dumper } from './dumper.js';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { config } from '../config/index.js';
 import path from 'path';
 import fs from 'fs/promises';
+import { promisify } from 'util';
+import { exec } from 'child_process';
 
 const execAsync = promisify(exec);
 const { Pool, Client } = pkg;
+const { database } = config;
 
 export class AnonymizationService {
-  constructor(dumpPath) {
+  constructor(dumpPath, dbEngine) {
     this.originalDumpFile = dumpPath;
     this.dumpsDirectory = path.join(process.cwd(), 'dumps');
-    this.docker = null;
-    this.container = null;
-    this.pool = null;
-    this.localPort = 15432;
-    this.host = 'localhost';
-    this.user = 'postgres';
-    this.password = 'anon_password';
-    this.databaseName = 'postgres';
-    this.maxRetries = 60;
+    this.dockerManager = new DockerManager();
+    this.dumper = new Dumper();
+    this.dbEngine = dbEngine;
+    this.localPort = database.port;
+    this.host = database.host;
+    this.user = database.user;
+    this.password = database.password;
+    this.databaseName = database.dbName;
+    this.maxRetries = database.maxRetries;
     this.retryInterval = 1000; // 1 second
-  }
-
-  async ensureDumpsDirectory() {
-    try {
-      await fs.access(this.dumpsDirectory);
-    } catch {
-      await fs.mkdir(this.dumpsDirectory, { recursive: true });
-      logger.info(`Created dumps directory at: ${this.dumpsDirectory}`);
-    }
-  }
-
-  async createAnonymizedDump(outputPath) {
-    try {
-      const timestamp = new Date().toISOString().slice(0, 19).replace(/[:]/g, '-');
-      const filename = `${timestamp}_anonymized_${outputPath}.sql`;
-      const finalPath = path.join(this.dumpsDirectory, filename);
-      
-      logger.info('Creating anonymized database dump...');
-  
-      // Stream directly to file instead of buffering in memory
-      const command = [
-        'PGPASSWORD=anon_pass',
-        'pg_dump',
-        `-h ${this.host}`,
-        `-p ${this.localPort}`, 
-        `-U dump_anon`,
-        `-d ${this.databaseName}_anon`,
-        '--no-owner',
-        '--no-acl',
-        '--no-security-labels',
-        `-f ${finalPath}` // Write directly to file
-      ].join(' ');
-  
-      // Execute with increased buffer size
-      await execAsync(command, {
-        maxBuffer: 1024 * 1024 * 100 // 100MB buffer
-      });
-  
-      logger.info(`Anonymized dump created successfully at: ${finalPath}`);
-      return finalPath;
-  
-    } catch (error) {
-      logger.error('Failed to create anonymized dump:', error);
-      throw error;
-    }
-  }
-
-  async importOriginalDump() {
-    if (!this.originalDumpFile) {
-      throw new Error('No dump file provided');
-    }
-  
-    try {
-      logger.info('Importing original dump...');
-      
-      // Import schema with increased buffer
-      const schemaCommand = [
-        `PGPASSWORD=${this.password}`,
-        'pg_restore',
-        `-h ${this.host}`,
-        `-p ${this.localPort}`,
-        `-U ${this.user}`,
-        `-d ${this.databaseName}_anon`, 
-        '--schema-only',
-        this.originalDumpFile
-      ].join(' ');
-  
-      await execAsync(schemaCommand, {
-        maxBuffer: 1024 * 1024 * 100 // 100MB buffer
-      });
-  
-      logger.info('Schema imported successfully');
-  
-      // Import data with increased buffer 
-      const dataCommand = [
-        `PGPASSWORD=${this.password}`,
-        'pg_restore', 
-        `-h ${this.host}`,
-        `-p ${this.localPort}`,
-        `-U ${this.user}`,
-        `-d ${this.databaseName}_anon`,
-        '--data-only',
-        this.originalDumpFile
-      ].join(' ');
-  
-      await execAsync(dataCommand, {
-        maxBuffer: 1024 * 1024 * 100 // 100MB buffer  
-      });
-  
-      logger.info('Data imported successfully');
-  
-    } catch (error) {
-      logger.error('Failed to import original dump:', error);
-      throw error;
-    }
+    this.pool = null;
   }
 
   async init() {
     try {
-      this.docker = new Docker();
-      await this.docker.ping();
-      logger.info('Docker connection established');
+      logger.info('Initializing Anonymization Service');
     } catch (error) {
-      logger.error('Failed to connect to Docker:', error);
-      throw new Error('Docker connection failed. Is Docker running?');
+      logger.error('Initialization failed:', error);
+      throw error;
     }
   }
 
@@ -136,11 +42,18 @@ export class AnonymizationService {
     try {
       logger.info('Starting setup process...');
       await this.ensureDumpsDirectory();
-      
-      // Validate dump file first
-      // await Dumper.validateDump(this.originalDumpFile);
-      
-      await this.initializeContainer();
+
+      await this.dockerManager.ensureCleanContainer('dump_postgresql');
+      await this.dockerManager.createAndStartContainer('dump_postgresql', 'registry.gitlab.com/dalibo/postgresql_anonymizer:latest', {
+        portBindings: { '5432/tcp': [{ HostPort: this.localPort.toString() }] },
+        env: [
+          `POSTGRES_PASSWORD=${this.password}`,
+          `POSTGRES_USER=${this.user}`,
+          `POSTGRES_DB=${this.databaseName}`,
+        ],
+        volumes: [`${this.dumpsDirectory}:/dumps`],
+      });
+
       await this.waitForPostgres();
       await this.initializeAnonDatabase();
       
@@ -158,139 +71,101 @@ export class AnonymizationService {
     }
   }
 
-  async initializeContainer() {
-    logger.info('Starting PostgreSQL Anonymizer container...');
+  async setupAnonymization() {
     try {
-        const containerConfig = {
-            Image: 'registry.gitlab.com/dalibo/postgresql_anonymizer:latest',
-            Env: [
-                `POSTGRES_PASSWORD=${this.password}`,
-                `POSTGRES_USER=${this.user}`,
-                `POSTGRES_DB=${this.databaseName}`,
-                'PGDATA=/var/lib/postgresql/data/pgdata'
-            ],
-            HostConfig: {
-                PortBindings: {
-                    '5432/tcp': [{ HostPort: this.localPort.toString() }]
-                },
-                RestartPolicy: {
-                    Name: 'no',
-                    MaximumRetryCount: 0
-                },
-                Memory: 2147483648, // 2GB
-                MemorySwap: 4294967296, // 4GB
-                Binds: [
-                    'pgdata:/var/lib/postgresql/data/pgdata' // Updated path
-                ]
-            },
-            Healthcheck: {
-                Test: ["CMD-SHELL", "pg_isready -U postgres || exit 1"],
-                Interval: 1000000000, // 1s in nanoseconds
-                Timeout: 3000000000,  // 3s
-                Retries: 5,
-                StartPeriod: 3000000000 // 3s initialization time
-            }
-        };
-
-        // Check and create volume if needed
-        const volumes = await this.docker.listVolumes();
-        if (!volumes.Volumes.find(v => v.Name === 'pgdata')) {
-            await this.docker.createVolume({ 
-                Name: 'pgdata',
-                Driver: 'local'
-            });
-            logger.info('Created pgdata volume');
-        }
-
-        // Pull image with proper progress tracking
-        try {
-            await this.docker.getImage(containerConfig.Image).inspect();
-        } catch (err) {
-            logger.info('Pulling PostgreSQL Anonymizer image...');
-            await new Promise((resolve, reject) => {
-                this.docker.pull(containerConfig.Image, (err, stream) => {
-                    if (err) return reject(err);
-                    this.docker.modem.followProgress(stream, 
-                        (err) => err ? reject(err) : resolve(),
-                        (event) => logger.debug('Pull progress:', event)
-                    );
-                });
-            });
-        }
-
-        // Create and start container
-        this.container = await this.docker.createContainer(containerConfig);
-        await this.container.start();
-
-        // Attach logging
-        const logStream = await this.container.logs({
-            follow: true,
-            stdout: true,
-            stderr: true,
-            timestamps: true
-        });
-
-        logStream.on('data', data => {
-            logger.debug('Container log:', data.toString().trim());
-        });
-
-        // Wait for health check
-        logger.info('Waiting for container health check...');
-        await this.waitForContainerHealth();
-        logger.info('Container started successfully');
-
-    } catch (error) {
-        logger.error('Container startup failed:', error);
-        
-        // Get container logs if available
-        if (this.container) {
-            try {
-                const logs = await this.container.logs({
-                    stdout: true,
-                    stderr: true,
-                    tail: 50
-                });
-                logger.error('Container logs:', logs.toString());
-            } catch (logError) {
-                logger.error('Failed to fetch container logs:', logError);
-            }
-        }
-        throw error;
-    }
-}
-
-async waitForContainerHealth() {
-  const maxRetries = 30;
-  const retryInterval = 2000; // 2s
-
-  for (let i = 0; i < maxRetries; i++) {
-      try {
-          const containerInfo = await this.container.inspect();
-          const state = containerInfo.State;
-          
-          if (state.Running && (!state.Health || state.Health.Status === 'healthy')) {
-              return;
-          }
-
-          if (state.ExitCode && state.ExitCode !== 0) {
-              throw new Error(`Container exited with code ${state.ExitCode}`);
-          }
-
-          logger.debug(`Container health status: ${state.Health?.Status || 'unknown'}`);
-          await new Promise(resolve => setTimeout(resolve, retryInterval));
-          
-      } catch (error) {
-          logger.error(`Health check attempt ${i + 1}/${maxRetries} failed:`, error);
-          if (i === maxRetries - 1) throw error;
-      }
-  }
+      logger.info('Setting up anonymization extensions and roles...');
   
-  throw new Error('Container health check failed after max retries');
-}
+      // Crear la extensión anon
+      await this.dockerManager.executeDockerCommand([
+        'exec',
+        'dump_postgresql',
+        'psql',
+        '-h', this.host,
+        '-p', this.localPort.toString(),
+        '-U', this.user,
+        '-d', this.databaseName,
+        '-c', '"CREATE EXTENSION IF NOT EXISTS anon CASCADE;"',
+      ]);
+  
+      // Inicializar anon
+      await this.dockerManager.executeDockerCommand([
+        'exec',
+        'dump_postgresql',
+        'psql',
+        '-h', this.host,
+        '-p', this.localPort.toString(),
+        '-U', this.user,
+        '-d', this.databaseName,
+        '-c', '"SELECT anon.init();"'
+      ]);
+  
+      // Crear y configurar el rol dump_anon
+      const roleSetupQuery = `
+        DO $$ BEGIN
+          IF EXISTS (
+              SELECT FROM pg_catalog.pg_roles
+              WHERE rolname = 'dump_anon') THEN
+            RAISE NOTICE 'Role "dump_anon" already exists. Skipping.';
+          ELSE
+            CREATE ROLE dump_anon LOGIN PASSWORD 'anon_pass';
+          END IF;
+        END $$;
+        ALTER ROLE dump_anon SET anon.transparent_dynamic_masking = True;
+        SECURITY LABEL FOR anon ON ROLE dump_anon IS 'MASKED';
+      `.trim().replace(/\s+/g, ' ');
+  
+      await this.dockerManager.executeDockerCommand([
+        'exec',
+        'dump_postgresql',
+        'psql',
+        '-h', this.host,
+        '-p', this.localPort.toString(),
+        '-U', this.user,
+        '-d', this.databaseName,
+        '-c', `"${roleSetupQuery}"`,
+      ]);
+  
+      // Configurar permisos para el rol dump_anon
+      const grantPermissionsQuery = `
+        GRANT USAGE ON SCHEMA public, anon TO dump_anon;
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO dump_anon;
+        GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO dump_anon;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA anon TO dump_anon;
+        GRANT SELECT ON ALL TABLES IN SCHEMA anon TO dump_anon;
+        GRANT SELECT ON pg_statistic TO dump_anon;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dump_anon;
+      `.trim().replace(/\s+/g, ' ');
+  
+      await this.dockerManager.executeDockerCommand([
+        'exec',
+        'dump_postgresql',
+        'psql',
+        '-h', this.host,
+        '-p', this.localPort.toString(),
+        '-U', this.user,
+        '-d', this.databaseName,
+        '-c', `"${grantPermissionsQuery}"`,
+      ]);
+  
+      logger.info('Anonymization setup completed successfully');
+    } catch (error) {
+      logger.error('Failed to setup anonymization:', error);
+      throw error;
+    }
+  }  
+  
+  async ensureDumpsDirectory() {
+    try {
+      await fs.access(this.dumpsDirectory);
+    } catch {
+      await fs.mkdir(this.dumpsDirectory, { recursive: true });
+      logger.info(`Created dumps directory at: ${this.dumpsDirectory}`);
+    }
+  }
 
   async waitForPostgres() {
     logger.info('Waiting for PostgreSQL to be ready...');
-    
+
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
         const client = new Client({
@@ -298,13 +173,13 @@ async waitForContainerHealth() {
           port: this.localPort,
           user: this.user,
           password: this.password,
-          database: 'postgres'
+          database: 'postgres',
         });
 
         await client.connect();
         await client.query('SELECT 1');
         await client.end();
-        
+
         logger.info('PostgreSQL is ready');
         return;
       } catch (error) {
@@ -324,90 +199,47 @@ async waitForContainerHealth() {
       port: this.localPort,
       user: this.user,
       password: this.password,
-      database: 'postgres'
+      database: 'postgres',
     });
-  
+
     try {
       await client.connect();
       logger.info('Initializing anonymization database...');
-      
-      // Drop database if exists (outside transaction)
-      await client.query(`DROP DATABASE IF EXISTS ${this.databaseName}_anon`);
-      
-      // Create fresh database (outside transaction)
-      await client.query(`CREATE DATABASE ${this.databaseName}_anon`);
-      
+
+      await client.query(`DROP DATABASE IF EXISTS ${this.databaseName}`);
+      await client.query(`CREATE DATABASE ${this.databaseName}`);
+
       logger.info('Anonymization database initialized');
     } catch (error) {
       logger.error('Failed to initialize database:', error);
       throw error;
     } finally {
-      await client.end().catch(err => 
-        logger.error('Error closing client:', err)
-      );
+      await client.end();
     }
   }
-  
-  async setupAnonymization() {
-    const client = new Client({
-      host: this.host,
-      port: this.localPort,
-      user: this.user,
-      password: this.password,
-      database: `${this.databaseName}_anon`
-    });
-  
+
+  async importOriginalDump() {
     try {
-      await client.connect();
-      logger.info('Setting up anonymization extensions and roles...');
-      
-      // Create extension (must be outside transaction)
-      await client.query('CREATE EXTENSION IF NOT EXISTS anon CASCADE');
-      
-      // Initialize anonymization (can be in transaction)
-      await client.query('BEGIN');
-      await client.query('SELECT anon.init()');
-      
-      // Setup anonymization role with enhanced permissions
-      await client.query('DROP ROLE IF EXISTS dump_anon');
-      await client.query(`
-        CREATE ROLE dump_anon LOGIN PASSWORD 'anon_pass';
-        ALTER ROLE dump_anon SET anon.transparent_dynamic_masking = True;
-        SECURITY LABEL FOR anon ON ROLE dump_anon IS 'MASKED';
-      `);
-      
-      // Grant comprehensive permissions
-      await client.query(`
-        GRANT USAGE ON SCHEMA public, anon TO dump_anon;
-        GRANT SELECT ON ALL TABLES IN SCHEMA public TO dump_anon;
-        GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO dump_anon;
-        
-        -- Grant access to anonymization functions and tables
-        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA anon TO dump_anon;
-        GRANT SELECT ON ALL TABLES IN SCHEMA anon TO dump_anon;
-        
-        -- Allow access to system catalogs needed for pg_dump
-        GRANT SELECT ON pg_statistic TO dump_anon;
-      `);
-      
-      // Make sure future tables are accessible
-      await client.query(`
-        ALTER DEFAULT PRIVILEGES IN SCHEMA public 
-        GRANT SELECT ON TABLES TO dump_anon;
-      `);
-      
-      await client.query('COMMIT');
-      logger.info('Anonymization setup completed successfully');
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      logger.error('Failed to setup anonymization:', error);
-      throw error;
-    } finally {
-      await client.end().catch(err => 
-        logger.error('Error closing client:', err)
+      logger.info('Importing original dump...');
+
+      const processedDump = await this.dumper.preprocessDump(this.originalDumpFile);
+      await this.dumper.importDump(
+        {
+          host: this.host,
+          port: this.localPort,
+          user: this.user,
+          password: this.password,
+          database: this.databaseName,
+        },
+        processedDump
       );
+
+      logger.info('Original dump imported successfully');
+    } catch (error) {
+      logger.error('Failed to import original dump:', error);
+      throw error;
     }
-}
+  }
 
   createPool() {
     return new Pool({
@@ -415,7 +247,7 @@ async waitForContainerHealth() {
       port: this.localPort,
       user: this.user,
       password: this.password,
-      database: `${this.databaseName}_anon`,
+      database: this.databaseName,
       max: 20,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 2000,
@@ -437,10 +269,10 @@ async waitForContainerHealth() {
           logger.warn(`Table ${tableName} does not exist, skipping...`);
           continue;
         }
-        
-        await this.processRule(client, tableName, rules);
-
-        // Verify data was masked
+  
+        await this.applyMaskingRules(client, tableName, rules[tableName]);
+  
+        // Verificar que los datos se hayan enmascarado
         const count = await this.verifyMasking(client, tableName);
         logger.info(`Masked ${count} rows in table ${tableName}`);
       }
@@ -456,120 +288,141 @@ async waitForContainerHealth() {
     }
   }
 
-  async verifyMasking(client, tableName) {
-    try {
-        // Use exactTableName stored during validation
-        const result = await client.query(`SELECT COUNT(*) FROM "${this.exactTableName}"`);
-        return parseInt(result.rows[0].count);
-    } catch (error) {
-        logger.error(`Failed to verify masking for table ${tableName}:`, error);
-        throw error;
-    }
-}
-
-async validateTable(client, tableName) {
-    // First get the exact case of the table name from the database
-    const result = await client.query(`
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        AND lower(table_name) = lower($1);
-    `, [tableName]);
-    
-    if (result.rows.length > 0) {
-        // Store the correct case table name as instance property
-        this.exactTableName = result.rows[0].table_name;
-        return true;
-    }
-    return false;
-}
-
   async validateTable(client, tableName) {
-    // First get the exact case of the table name from the database
-    const result = await client.query(`
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public' 
+    const result = await client.query(
+      `
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public' 
         AND lower(table_name) = lower($1);
-    `, [tableName]);
-    
-    if (result.rows.length > 0) {
-        // Store the correct case table name as instance property
-        this.exactTableName = result.rows[0].table_name;
-        return true;
-    }
-    return false;
-}
-
-  async processRule(client, tableName, rules) {
-    logger.info(`Processing rule for table: ${tableName}`);
+      `,
+      [tableName]
+    );
   
-    const tableRules = rules[tableName];
+    if (result.rows.length > 0) {
+      this.exactTableName = result.rows[0].table_name; // Almacena el nombre exacto para futuras consultas
+      return true;
+    }
+  
+    return false;
+  }
+
+  async applyMaskingRules(client, tableName, tableRules) {
     if (!tableRules || !tableRules.masks) {
       logger.warn(`No masks found for table ${tableName}`);
       return;
     }
   
-    // Use the exact table name we found during validation
-    const exactTableName = this.exactTableName;
-    
     for (const [column, maskFunction] of Object.entries(tableRules.masks)) {
       try {
-        await client.query(`
-          SECURITY LABEL FOR anon ON COLUMN "${exactTableName}".${column}
+        await client.query(
+          `
+          SECURITY LABEL FOR anon ON COLUMN "${this.exactTableName}".${column}
           IS 'MASKED WITH FUNCTION ${maskFunction}';
-        `);
-        logger.info(`Successfully masked ${exactTableName}.${column}`);
+          `
+        );
+        logger.info(`Successfully masked ${this.exactTableName}.${column}`);
       } catch (error) {
-        logger.error(`Failed to mask ${exactTableName}.${column}:`, error);
+        logger.error(`Failed to mask ${this.exactTableName}.${column}:`, error);
         throw error;
       }
     }
   }
-
-  async importOriginalDump() {
-    if (!this.originalDumpFile) {
-      throw new Error('No dump file provided');
-    }
   
+  async verifyMasking(client, tableName) {
     try {
-      logger.info('Importing original dump...');
-      const output = await Dumper.importDump({
-        host: this.host,
-        port: this.localPort,
-        user: this.user,
-        password: this.password,
-        database: `${this.databaseName}_anon`
-      }, this.originalDumpFile);
-      
-      logger.info('Original dump imported successfully');
-      return output;
+      const result = await client.query(`SELECT COUNT(*) FROM "${this.exactTableName}"`);
+      return parseInt(result.rows[0].count);
     } catch (error) {
-      logger.error('Failed to import original dump:', error);
+      logger.error(`Failed to verify masking for table ${tableName}:`, error);
       throw error;
     }
   }
-
+  
   async cleanup() {
     logger.info('Starting cleanup...');
-    
-    if (this.pool) {
-      try {
-        await this.pool.end();   
+    try {
+      if (this.pool) {
+        await this.pool.end();
         logger.info('Database pool closed');
-      } catch (error) {
-        logger.error('Error closing database pool:', error);
       }
-    }
-    
-    if (this.container) {
-      try {
-        await this.container.stop();
-        await this.container.remove();
-        logger.info('Docker container cleaned up');
-      } catch (error) {
-        logger.error('Error cleaning up container:', error);
-      }
+
+      await this.dockerManager.ensureCleanContainer();
+      logger.info('Docker container cleaned up');
+    } catch (error) {
+      logger.error('Error during cleanup:', error);
     }
   }
+
+  async createAnonymizedDump(outputPath) {
+    try {
+      const timestamp = new Date().toISOString().slice(0, 19).replace(/[:]/g, '-');
+      const filename = `${timestamp}_anonymized_${outputPath}.sql`;
+      const finalPath = path.join(this.dumpsDirectory, filename);
+  
+      logger.info('Preparing database for anonymized dump...');
+  
+      // Crear el archivo cleanup.sql en el sistema local
+      const cleanupFilePath = path.join(this.dumpsDirectory, 'cleanup.sql');
+      const cleanupScript = `
+        DO $$ BEGIN
+          -- Remove security labels added by anon
+          DELETE FROM pg_catalog.pg_seclabel WHERE provider = 'anon';
+  
+          -- Drop the anon extension
+          DROP EXTENSION IF EXISTS anon CASCADE;
+        END $$;
+      `;
+  
+      // Escribir el script en el sistema local
+      await fs.writeFile(cleanupFilePath, cleanupScript);
+      logger.info(`Cleanup script created at ${cleanupFilePath}`);
+  
+      // Copiar el archivo al contenedor
+      await this.dockerManager.executeDockerCommand([
+        'cp',
+        cleanupFilePath,
+        'dump_postgresql:/dumps/cleanup.sql',
+      ]);
+      logger.info('Cleanup script copied to container.');
+  
+      // Ejecutar el script dentro del contenedor
+      await this.dockerManager.executeDockerCommand([
+        'exec',
+        'dump_postgresql',
+        'psql',
+        '-h', this.host,
+        '-p', this.localPort.toString(),
+        '-U', this.user,
+        '-d', this.databaseName,
+        '-f', '/dumps/cleanup.sql',
+      ]);
+  
+      logger.info('Database prepared for anonymized dump.');
+  
+      // Crear el dump final
+      const command = [
+        'exec',
+        'dump_postgresql',
+        'pg_dump',
+        '-h', this.host,
+        '-p', this.localPort,
+        '-U', this.user,
+        '-d', this.databaseName,
+        '--no-owner',
+        '--no-acl',
+        '--no-security-labels',
+        `-f /dumps/${path.basename(finalPath)}`,
+      ];
+  
+      await this.dockerManager.executeDockerCommand(command);
+  
+      logger.info(`Anonymized dump created successfully at: ${finalPath}`);
+      return finalPath;
+    } catch (error) {
+      logger.error('Failed to create anonymized dump:', error);
+      throw error;
+    }
+  }  
+     
 }
